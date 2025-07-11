@@ -1,0 +1,108 @@
+# === Required libraries ===
+import cv2                     # OpenCV for camera input and image processing
+import numpy as np             # Numerical operations (used by YOLO)
+import RPi.GPIO as GPIO        # For reading ultrasonic sensor
+import time                    # For delays and timing pulses
+import requests                # For sending HTTP request to ESP32
+
+# === HC-SR04 Ultrasonic Sensor Pin Setup ===
+TRIG = 23  # Connect TRIG pin of HC-SR04 to GPIO 23
+ECHO = 24  # Connect ECHO pin of HC-SR04 to GPIO 24
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(TRIG, GPIO.OUT)
+GPIO.setup(ECHO, GPIO.IN)
+
+def get_distance():
+    """
+    Measures distance using the ultrasonic sensor.
+    Returns distance in centimeters.
+    """
+    GPIO.output(TRIG, True)
+    time.sleep(0.00001)
+    GPIO.output(TRIG, False)
+
+    while GPIO.input(ECHO) == 0:
+        pulse_start = time.time()
+    while GPIO.input(ECHO) == 1:
+        pulse_end = time.time()
+
+    pulse_duration = pulse_end - pulse_start
+    distance = pulse_duration * 17150  # Speed of sound = 343 m/s = 17150 cm/s for round trip
+    distance = round(distance, 2)
+    return distance
+
+# === Replace this with ESP32 IP Address ===
+ESP_IP = "http://<ESP32_IP_ADDRESS>"  # 👈 e.g. http://192.168.1.42
+
+def send_command_to_esp(command):
+    """
+    Sends movement direction as an HTTP GET request to ESP32.
+    ESP must have an endpoint like /move?direction=FORWARD
+    """
+    try:
+        url = f"{ESP_IP}/move?direction={command}"
+        response = requests.get(url)
+        print(f"[✓] Sent {command} → ESP Response: {response.text}")
+    except:
+        print("[X] Failed to send command to ESP32!")
+
+# === Load YOLOv11 model ===
+net = cv2.dnn.readNet("yolov11.weights", "yolov11.cfg")  # 👈 Make sure these files are in same directory
+layer_names = net.getLayerNames()
+output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
+
+# === Open the camera (change index if needed) ===
+camera = cv2.VideoCapture(0)
+
+try:
+    while True:
+        ret, frame = camera.read()
+        height, width, _ = frame.shape
+
+        # === Prepare image for YOLO (resize, normalize) ===
+        blob = cv2.dnn.blobFromImage(frame, 0.00392, (416, 416), True, crop=False)
+        net.setInput(blob)
+        outputs = net.forward(output_layers)
+
+        object_center_x = None
+
+        # === Loop through all detections ===
+        for out in outputs:
+            for detection in out:
+                scores = detection[5:]  # Confidence scores for all classes
+                class_id = np.argmax(scores)
+                confidence = scores[class_id]
+
+                if confidence > 0.5:  # 👈 Only consider if confident enough
+                    center_x = int(detection[0] * width)
+                    object_center_x = center_x
+                    break
+
+        # === Measure front distance using ultrasonic ===
+        distance = get_distance()
+        print(f"Obstacle Distance: {distance} cm")
+
+        # === Decide movement ===
+        if object_center_x is not None:
+            # If too close to obstacle
+            if distance < 20:
+                send_command_to_esp("STOP")
+            elif object_center_x < width // 3:
+                send_command_to_esp("LEFT")
+            elif object_center_x > 2 * width // 3:
+                send_command_to_esp("RIGHT")
+            else:
+                send_command_to_esp("FORWARD")
+        else:
+            send_command_to_esp("STOP")  # No object detected
+
+        time.sleep(0.5)  # Delay between loops to avoid flooding ESP
+
+except KeyboardInterrupt:
+    print("Stopping gracefully...")
+
+finally:
+    GPIO.cleanup()
+    camera.release()
+    cv2.destroyAllWindows()
